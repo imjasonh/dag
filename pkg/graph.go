@@ -1,16 +1,13 @@
 package pkg
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"io/fs"
 	"log"
 	"sort"
 	"strings"
-	"text/template"
 
-	"github.com/Masterminds/sprig"
 	"github.com/dominikbraun/graph"
 	"gopkg.in/yaml.v3"
 )
@@ -136,26 +133,32 @@ func decodeMelangeYAML(f fs.File) (Config, error) {
 		return Config{}, fmt.Errorf("unable to decode %q: %w", stat.Name(), err)
 	}
 
-	protected := string(b)
-	for k, v := range substitutionReplacements() {
-		protected = strings.ReplaceAll(protected, k, v)
-	}
-
-	tmpl, err := template.New("").Funcs(sprig.TxtFuncMap()).Parse(protected)
-	if err != nil {
-		return Config{}, fmt.Errorf("unable to decode %q: %w", stat.Name(), err)
-	}
-
-	buf := new(bytes.Buffer)
-	err = tmpl.Execute(buf, nil)
-	if err != nil {
-		return Config{}, fmt.Errorf("unable to decode %q: %w", stat.Name(), err)
-	}
-
 	var c Config
-	if err := yaml.NewDecoder(buf).Decode(&c); err != nil {
+	if err := yaml.Unmarshal(b, &c); err != nil {
 		return Config{}, fmt.Errorf("unable to decode %q: %w", stat.Name(), err)
 	}
+
+	// Hydrate subpackages that use a range.
+	var updated []Subpackage
+	for _, sp := range c.Subpackages {
+		if sp.Range == "" {
+			updated = append(updated, Subpackage{Name: sp.Name})
+		} else {
+			for _, d := range c.Data {
+				if d.Name == sp.Range {
+					for k, v := range d.Items {
+						n := d.Name
+						n = strings.ReplaceAll(n, "${{range.key}}", k)
+						n = strings.ReplaceAll(n, "${{range.value}}", v)
+						updated = append(updated, Subpackage{Name: n})
+					}
+					break
+				}
+			}
+		}
+	}
+	sort.Slice(updated, func(i, j int) bool { return updated[i].Name < updated[j].Name })
+	c.Subpackages = updated
 
 	return c, nil
 }
@@ -200,7 +203,7 @@ func (g Graph) IsSubpackage(name string) bool {
 // order, meaning that packages earlier in the list depend on packages later in
 // the list.
 func (g Graph) Sorted() ([]string, error) {
-	sorted, err := graph.TopologicalSort[string, string](g.Graph)
+	sorted, err := graph.TopologicalSort(g.Graph)
 	if err != nil {
 		return nil, err
 	}
@@ -330,7 +333,7 @@ func (g Graph) DependenciesOf(node string) []string {
 	var dependencies []string
 
 	if deps, ok := adjacencyMap[node]; ok {
-		for dep, _ := range deps {
+		for dep := range deps {
 			dependencies = append(dependencies, dep)
 		}
 

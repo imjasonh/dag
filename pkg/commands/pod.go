@@ -10,8 +10,10 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
+	"text/template"
 	"time"
 
 	"chainguard.dev/apko/pkg/build/types"
@@ -43,6 +45,11 @@ func gcloudProjectID(ctx context.Context) (string, error) {
 	return string(bytes.TrimSuffix(b, []byte{'\n'})), nil // Trim trailing newline.
 }
 
+var realBuckets = map[string]bool{
+	"wolfi-production-registry-source": true,
+	"wolfi-registry-source":            true, // staging
+}
+
 func cmdPod() *cobra.Command {
 	var dir, arch, project, bundleRepo, ns, cpu, ram, sa, sdkimg, cachedig, bucket, srcBucket string
 	var create, watch, secretKey bool
@@ -69,28 +76,57 @@ func cmdPod() *cobra.Command {
 				log.Println("Bundle repo is", bundleRepo)
 			}
 
-			targets := []string{"all"}
-			if len(args) > 0 {
-				g, err := pkg.NewGraph(os.DirFS(dir))
+			for b := range realBuckets {
+				if strings.HasPrefix(bucket, b) && !secretKey {
+					return fmt.Errorf("cowardly refusing to push to real bucket %s without secret key", bucket)
+				}
+			}
+
+			g, err := pkg.NewGraph(os.DirFS(dir))
+			if err != nil {
+				return err
+			}
+
+			var targets []string
+			deps := map[string]struct{}{}
+			if len(args) == 0 {
+				nodes, err := g.Sorted()
 				if err != nil {
 					return err
 				}
-
-				subgraph, err := g.SubgraphWithRoots(args)
-				if err != nil {
-					return err
+				for _, n := range nodes {
+					t, err := g.MakeTarget(n, arch)
+					if err != nil {
+						return fmt.Errorf("failed to make target for %s: %v", n, err)
+					}
+					targets = append(targets, t)
 				}
-
-				targets = nil
-				for _, node := range subgraph.Nodes() {
-					t, err := g.MakeTarget(node, arch)
+			} else {
+				targets = make([]string, 0, len(args))
+				for _, arg := range args {
+					t, err := g.MakeTarget(arg, arch)
 					if err != nil {
 						return err
 					}
-
 					targets = append(targets, t)
 				}
+
+				for _, arg := range args {
+					for _, d := range g.DependenciesOf(arg) {
+						d, err = g.MakeTarget(d, arch)
+						if err != nil {
+							return err
+						}
+						deps[strings.TrimPrefix(d, "packages/")] = struct{}{}
+					}
+				}
+
 			}
+			depsList := make([]string, 0, len(deps))
+			for k := range deps {
+				depsList = append(depsList, k)
+			}
+			sort.Strings(depsList)
 
 			// Bundle the source context into an image.
 			t, err := name.NewTag(bundleRepo, name.WeakValidation)
@@ -102,6 +138,47 @@ func cmdPod() *cobra.Command {
 				return err
 			}
 			log.Println("bundled source context to", dig)
+
+			var buf bytes.Buffer
+			if err := template.Must(template.New("").Parse(`
+set -euo pipefail
+
+# Use or generate secret.
+if [[ ! -f /var/secrets/melange.rsa ]]; then
+  echo "Generating key..."
+  MELANGE=/usr/bin/melange KEY=wolfi-signing.rsa make wolfi-signing.rsa
+else
+  echo "Using secret key..."
+  cp /var/secrets/melange.rsa wolfi-signing.rsa
+fi
+
+# Prepopulate dependencies.
+mkdir -p /workspace/packages/{{.Arch}}/
+{{ range .Deps }}wget -P /workspace/packages/{{$.Arch}} https://packages.wolfi.dev/os/{{.}}
+{{ end }}
+wget -O wolfi-signing.rsa.pub https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+wget -P /workspace/packages/{{.Arch}}/ https://packages.wolfi.dev/os/{{.Arch}}/APKINDEX.tar.gz
+
+ls -R /workspace/packages
+
+# Build targets.
+{{ range .Targets }}MELANGE=/usr/bin/melange KEY=wolfi-signing.rsa make {{ . }}
+{{ end }}rm melange.rsa
+
+# Trigger gsutil upload step.
+touch start-gsutil-cp
+echo exiting...
+exit 0
+`)).Execute(&buf, struct {
+				Deps, Targets []string
+				Arch          string
+			}{
+				Deps:    depsList,
+				Targets: targets,
+				Arch:    arch,
+			}); err != nil {
+				return err
+			}
 
 			p := &corev1.Pod{
 				TypeMeta: metav1.TypeMeta{
@@ -171,29 +248,9 @@ gsutil -m rsync -r %s ./packages/
 						SecurityContext: &corev1.SecurityContext{
 							Privileged: pointer.Bool(true),
 						},
-						Command: []string{"sh", "-c", fmt.Sprintf(`
-set -euo pipefail
-ls /var/cache/melange
-if [[ ! -f /var/secrets/melange.rsa ]]; then
-  echo "Generating key..."
-  MELANGE=/usr/bin/melange KEY=melange.rsa make melange.rsa
-  KEY=melange.rsa
-else
-  echo "Using secret key..."
-  cp /var/secrets/melange.rsa wolfi-signing.rsa
-  wget -O wolfi-signing.rsa.pub https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
-  KEY=wolfi-signing.rsa
-  cat wolfi-signing.rsa.pub
-  ls wolfi-signing.rsa
-fi
-
-set +e # Always touch start-gsutil-cp to start uploading buitl packages, even if the build fails.
-find ./packages -print -exec touch \{} \;
-MELANGE=/usr/bin/melange MELANGE_DIR=/usr/share/melange KEY=${KEY} REPO=./packages make %s
-rm ${KEY}
-touch start-gsutil-cp
-echo exiting...
-exit 0`, strings.Join(targets, " ")),
+						Command: []string{
+							"sh", "-c",
+							buf.String(),
 						},
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
