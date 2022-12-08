@@ -3,7 +3,6 @@ package commands
 import (
 	"fmt"
 	"log"
-	"os"
 
 	"github.com/dominikbraun/graph"
 	"github.com/goccy/go-graphviz"
@@ -18,7 +17,7 @@ func cmdSVG() *cobra.Command {
 		Use:   "svg",
 		Short: "Generate a graphviz SVG",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			g, err := pkg.NewGraph(os.DirFS(dir))
+			g, err := pkg.NewGraph(dir, pkg.BuildTime)
 			if err != nil {
 				return err
 			}

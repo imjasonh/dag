@@ -82,7 +82,7 @@ func cmdPod() *cobra.Command {
 				}
 			}
 
-			g, err := pkg.NewGraph(os.DirFS(dir))
+			g, err := pkg.NewGraph(dir, pkg.BuildTime)
 			if err != nil {
 				return err
 			}
@@ -113,18 +113,27 @@ func cmdPod() *cobra.Command {
 
 				for _, arg := range args {
 					for _, d := range g.DependenciesOf(arg) {
-						d, err = g.MakeTarget(d, arch)
-						if err != nil {
-							return err
-						}
-						deps[strings.TrimPrefix(d, "packages/")] = struct{}{}
+						deps[d] = struct{}{}
 					}
 				}
 
+				rg, err := pkg.NewGraph(dir, pkg.RunTime)
+				if err != nil {
+					return err
+				}
+				for d := range deps {
+					for _, rd := range rg.DependenciesOf(d) {
+						deps[rd] = struct{}{}
+					}
+				}
 			}
 			depsList := make([]string, 0, len(deps))
-			for k := range deps {
-				depsList = append(depsList, k)
+			for d := range deps {
+				dt, err := g.MakeTarget(d, arch)
+				if err != nil {
+					return err
+				}
+				depsList = append(depsList, strings.TrimPrefix(dt, "packages/"))
 			}
 			sort.Strings(depsList)
 
@@ -143,14 +152,19 @@ func cmdPod() *cobra.Command {
 			if err := template.Must(template.New("").Parse(`
 set -euo pipefail
 
-# Use or generate secret.
 if [[ ! -f /var/secrets/melange.rsa ]]; then
   echo "Generating key..."
-  MELANGE=/usr/bin/melange KEY=wolfi-signing.rsa make wolfi-signing.rsa
+  MELANGE=/usr/bin/melange KEY=melange.rsa make melange.rsa
+  KEY=melange.rsa
 else
   echo "Using secret key..."
   cp /var/secrets/melange.rsa wolfi-signing.rsa
+  wget -O wolfi-signing.rsa.pub https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+  KEY=wolfi-signing.rsa
+  cat wolfi-signing.rsa.pub
+  ls wolfi-signing.rsa
 fi
+rm ${KEY}
 
 # Prepopulate dependencies.
 mkdir -p /workspace/packages/{{.Arch}}/
@@ -162,8 +176,8 @@ wget -P /workspace/packages/{{.Arch}}/ https://packages.wolfi.dev/os/{{.Arch}}/A
 ls -R /workspace/packages
 
 # Build targets.
-{{ range .Targets }}MELANGE=/usr/bin/melange KEY=wolfi-signing.rsa make {{ . }}
-{{ end }}rm melange.rsa
+{{ range .Targets }}MELANGE=/usr/bin/melange KEY=${KEY} MELANGE_EXTRA_OPTS="--keyring-append=wolfi-signing.rsa.pub" make {{ . }}
+{{ end }}rm ${KEY}
 
 # Trigger gsutil upload step.
 touch start-gsutil-cp
